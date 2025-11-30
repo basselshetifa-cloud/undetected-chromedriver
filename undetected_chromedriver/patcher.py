@@ -19,12 +19,79 @@ import sys
 import time
 from urllib.request import urlopen
 from urllib.request import urlretrieve
+import weakref
 import zipfile
 from multiprocessing import Lock
 
 logger = logging.getLogger(__name__)
 
 IS_POSIX = sys.platform.startswith(("darwin", "cygwin", "linux", "linux2"))
+
+# Module-level storage for cleanup references using weak references
+_patcher_instances = weakref.WeakSet()
+_original_sigterm_handler = None
+_original_sigint_handler = None
+_signal_handlers_registered = False
+
+
+def _cleanup_all_instances():
+    """Module-level cleanup function for atexit"""
+    for patcher in list(_patcher_instances):
+        try:
+            patcher.cleanup()
+        except Exception as e:
+            logger.debug("error during atexit cleanup: %s", e)
+
+
+def _signal_handler(signum, frame):
+    """Module-level signal handler"""
+    logger.info("Received signal %s, cleaning up...", signum)
+    
+    # Cleanup all registered patcher instances
+    for patcher in list(_patcher_instances):
+        try:
+            patcher.cleanup()
+        except Exception as e:
+            logger.debug("error during signal cleanup: %s", e)
+    
+    # Call original handler if it exists and is callable
+    original_handler = None
+    if signum == signal.SIGTERM:
+        original_handler = _original_sigterm_handler
+    elif signum == signal.SIGINT:
+        original_handler = _original_sigint_handler
+    
+    if original_handler and callable(original_handler) and original_handler not in (signal.SIG_DFL, signal.SIG_IGN):
+        try:
+            original_handler(signum, frame)
+        except Exception as e:
+            logger.debug("error calling original signal handler: %s", e)
+    
+    # Raise KeyboardInterrupt for SIGINT to allow normal Python shutdown
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt()
+
+
+def _register_module_signal_handlers():
+    """Register module-level signal handlers (called once)"""
+    global _signal_handlers_registered, _original_sigterm_handler, _original_sigint_handler
+    
+    if _signal_handlers_registered:
+        return
+    
+    # Register atexit handler
+    atexit.register(_cleanup_all_instances)
+    
+    # Only register signal handlers on POSIX systems
+    # Windows does not support SIGTERM in the same way
+    if IS_POSIX:
+        _original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        _original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
+    
+    _signal_handlers_registered = True
+    logger.debug("module-level cleanup handlers registered")
 
 
 class Patcher(object):
@@ -108,50 +175,18 @@ class Patcher(object):
         self._register_cleanup_handlers()
 
     def _register_cleanup_handlers(self):
-        """Register atexit and signal handlers for cleanup"""
+        """Register this instance for cleanup via module-level handlers"""
         if self._cleanup_registered:
             return
         
-        # Use lambda to avoid holding a strong reference to self
-        # This allows the object to be garbage collected properly
-        atexit.register(lambda: self.cleanup() if hasattr(self, 'executable_path') else None)
+        # Register module-level signal handlers (only once)
+        _register_module_signal_handlers()
         
-        # Only register signal handlers on POSIX systems
-        # Windows does not support SIGTERM in the same way
-        if IS_POSIX:
-            # Store original handlers to chain them
-            self._original_sigterm = signal.getsignal(signal.SIGTERM)
-            self._original_sigint = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGTERM, self._signal_handler)
-            signal.signal(signal.SIGINT, self._signal_handler)
+        # Add this instance to the weak set for cleanup
+        _patcher_instances.add(self)
         
         self._cleanup_registered = True
-        logger.debug("cleanup handlers registered")
-
-    def _signal_handler(self, signum, frame):
-        """Handle termination signals"""
-        logger.info("Received signal %s, cleaning up...", signum)
-        try:
-            self.cleanup()
-        except Exception as e:
-            logger.debug("error during signal cleanup: %s", e)
-        
-        # Call original handler if it exists and is callable
-        original_handler = None
-        if signum == signal.SIGTERM:
-            original_handler = getattr(self, '_original_sigterm', None)
-        elif signum == signal.SIGINT:
-            original_handler = getattr(self, '_original_sigint', None)
-        
-        if original_handler and callable(original_handler):
-            try:
-                original_handler(signum, frame)
-            except Exception:
-                pass
-        
-        # Raise KeyboardInterrupt for SIGINT to allow normal Python shutdown
-        if signum == signal.SIGINT:
-            raise KeyboardInterrupt()
+        logger.debug("instance registered for cleanup")
 
     def cleanup(self):
         """Clean up chromedriver processes and files"""
