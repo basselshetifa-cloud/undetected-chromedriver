@@ -112,11 +112,16 @@ class Patcher(object):
         if self._cleanup_registered:
             return
         
-        atexit.register(self.cleanup)
+        # Use lambda to avoid holding a strong reference to self
+        # This allows the object to be garbage collected properly
+        atexit.register(lambda: self.cleanup() if hasattr(self, 'executable_path') else None)
         
         # Only register signal handlers on POSIX systems
         # Windows does not support SIGTERM in the same way
         if IS_POSIX:
+            # Store original handlers to chain them
+            self._original_sigterm = signal.getsignal(signal.SIGTERM)
+            self._original_sigint = signal.getsignal(signal.SIGINT)
             signal.signal(signal.SIGTERM, self._signal_handler)
             signal.signal(signal.SIGINT, self._signal_handler)
         
@@ -126,16 +131,36 @@ class Patcher(object):
     def _signal_handler(self, signum, frame):
         """Handle termination signals"""
         logger.info("Received signal %s, cleaning up...", signum)
-        self.cleanup()
-        sys.exit(0)
+        try:
+            self.cleanup()
+        except Exception as e:
+            logger.debug("error during signal cleanup: %s", e)
+        
+        # Call original handler if it exists and is callable
+        original_handler = None
+        if signum == signal.SIGTERM:
+            original_handler = getattr(self, '_original_sigterm', None)
+        elif signum == signal.SIGINT:
+            original_handler = getattr(self, '_original_sigint', None)
+        
+        if original_handler and callable(original_handler):
+            try:
+                original_handler(signum, frame)
+            except Exception:
+                pass
+        
+        # Raise KeyboardInterrupt for SIGINT to allow normal Python shutdown
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt()
 
     def cleanup(self):
         """Clean up chromedriver processes and files"""
         logger.debug("cleanup called")
         try:
             # Kill any running chromedriver instances
-            if hasattr(self, 'executable_path') and self.executable_path:
-                self.force_kill_instances(self.executable_path)
+            exe_path = getattr(self, 'executable_path', None)
+            if exe_path:
+                self.force_kill_instances(exe_path)
         except Exception as e:
             logger.debug("error during cleanup: %s", e)
 
@@ -450,27 +475,35 @@ class Patcher(object):
         )
 
     def __del__(self):
-        if self._custom_exe_path:
-            # if the driver binary is specified by user
-            # we assume it is important enough to not delete it
-            return
-        
-        # Perform cleanup of any running chromedriver processes
-        self.cleanup()
-        
-        if self.user_multi_procs:
-            return
-        
-        timeout = 3  # stop trying after this many seconds
-        t = time.monotonic()
-        while time.monotonic() - t < timeout:
-            # we don't want to wait until the end of time
-            try:
-                os.unlink(self.executable_path)
-                logger.debug("successfully unlinked %s" % self.executable_path)
-                break
-            except (OSError, RuntimeError, PermissionError):
-                time.sleep(0.01)
-                continue
-            except FileNotFoundError:
-                break
+        try:
+            if getattr(self, '_custom_exe_path', False):
+                # if the driver binary is specified by user
+                # we assume it is important enough to not delete it
+                return
+            
+            # Perform cleanup of any running chromedriver processes
+            self.cleanup()
+            
+            if getattr(self, 'user_multi_procs', False):
+                return
+            
+            exe_path = getattr(self, 'executable_path', None)
+            if not exe_path:
+                return
+            
+            timeout = 3  # stop trying after this many seconds
+            t = time.monotonic()
+            while time.monotonic() - t < timeout:
+                # we don't want to wait until the end of time
+                try:
+                    os.unlink(exe_path)
+                    logger.debug("successfully unlinked %s" % exe_path)
+                    break
+                except (OSError, RuntimeError, PermissionError):
+                    time.sleep(0.01)
+                    continue
+                except FileNotFoundError:
+                    break
+        except Exception:
+            # Ignore any exceptions during destruction
+            pass
