@@ -2,6 +2,7 @@
 # this module is part of undetected_chromedriver
 
 from packaging.version import Version as LooseVersion
+import atexit
 import io
 import json
 import logging
@@ -11,18 +12,86 @@ import platform
 import random
 import re
 import shutil
+import signal
 import string
 import subprocess
 import sys
 import time
 from urllib.request import urlopen
 from urllib.request import urlretrieve
+import weakref
 import zipfile
 from multiprocessing import Lock
 
 logger = logging.getLogger(__name__)
 
 IS_POSIX = sys.platform.startswith(("darwin", "cygwin", "linux", "linux2"))
+
+# Module-level storage for cleanup references using weak references
+_patcher_instances = weakref.WeakSet()
+_original_sigterm_handler = None
+_original_sigint_handler = None
+_signal_handlers_registered = False
+
+
+def _cleanup_all_instances():
+    """Module-level cleanup function for atexit"""
+    for patcher in list(_patcher_instances):
+        try:
+            patcher.cleanup()
+        except Exception as e:
+            logger.debug("error during atexit cleanup: %s", e)
+
+
+def _signal_handler(signum, frame):
+    """Module-level signal handler"""
+    logger.info("Received signal %s, cleaning up...", signum)
+    
+    # Cleanup all registered patcher instances
+    for patcher in list(_patcher_instances):
+        try:
+            patcher.cleanup()
+        except Exception as e:
+            logger.debug("error during signal cleanup: %s", e)
+    
+    # Call original handler if it exists and is callable
+    original_handler = None
+    if signum == signal.SIGTERM:
+        original_handler = _original_sigterm_handler
+    elif signum == signal.SIGINT:
+        original_handler = _original_sigint_handler
+    
+    if original_handler and callable(original_handler) and original_handler not in (signal.SIG_DFL, signal.SIG_IGN):
+        try:
+            original_handler(signum, frame)
+        except Exception as e:
+            logger.debug("error calling original signal handler: %s", e)
+    
+    # Raise KeyboardInterrupt for SIGINT to allow normal Python shutdown
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt()
+
+
+def _register_module_signal_handlers():
+    """Register module-level signal handlers (called once)"""
+    global _signal_handlers_registered, _original_sigterm_handler, _original_sigint_handler
+    
+    if _signal_handlers_registered:
+        return
+    
+    # Register atexit handler
+    atexit.register(_cleanup_all_instances)
+    
+    # Only register signal handlers on POSIX systems
+    # Windows does not support SIGTERM in the same way
+    if IS_POSIX:
+        _original_sigterm_handler = signal.getsignal(signal.SIGTERM)
+        _original_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGTERM, _signal_handler)
+        signal.signal(signal.SIGINT, _signal_handler)
+    
+    _signal_handlers_registered = True
+    logger.debug("module-level cleanup handlers registered")
 
 
 class Patcher(object):
@@ -100,6 +169,35 @@ class Patcher(object):
 
         self.version_main = version_main
         self.version_full = None
+
+        # Register cleanup handlers
+        self._cleanup_registered = False
+        self._register_cleanup_handlers()
+
+    def _register_cleanup_handlers(self):
+        """Register this instance for cleanup via module-level handlers"""
+        if self._cleanup_registered:
+            return
+        
+        # Register module-level signal handlers (only once)
+        _register_module_signal_handlers()
+        
+        # Add this instance to the weak set for cleanup
+        _patcher_instances.add(self)
+        
+        self._cleanup_registered = True
+        logger.debug("instance registered for cleanup")
+
+    def cleanup(self):
+        """Clean up chromedriver processes and files"""
+        logger.debug("cleanup called")
+        try:
+            # Kill any running chromedriver instances
+            exe_path = getattr(self, 'executable_path', None)
+            if exe_path:
+                self.force_kill_instances(exe_path)
+        except Exception as e:
+            logger.debug("error during cleanup: %s", e)
 
     def _set_platform_name(self):
         """
@@ -342,8 +440,20 @@ class Patcher(object):
                 return False
         else:
             try:
+                # Windows: Hide console window
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                creationflags = subprocess.CREATE_NO_WINDOW
+                
                 # TASKKILL /F /IM chromedriver.exe
-                result = subprocess.run(["taskkill", "/f", "/im", exe_name], check=False, capture_output=True)
+                result = subprocess.run(
+                    ["taskkill", "/f", "/im", exe_name],
+                    check=False,
+                    capture_output=True,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags
+                )
                 # taskkill returns 0 if process was killed, 128 if not found.
                 return result.returncode == 0
             except Exception as e:
@@ -400,24 +510,35 @@ class Patcher(object):
         )
 
     def __del__(self):
-        if self._custom_exe_path:
-            # if the driver binary is specified by user
-            # we assume it is important enough to not delete it
-            return
-        else:
+        try:
+            if getattr(self, '_custom_exe_path', False):
+                # if the driver binary is specified by user
+                # we assume it is important enough to not delete it
+                return
+            
+            # Perform cleanup of any running chromedriver processes
+            self.cleanup()
+            
+            if getattr(self, 'user_multi_procs', False):
+                return
+            
+            exe_path = getattr(self, 'executable_path', None)
+            if not exe_path:
+                return
+            
             timeout = 3  # stop trying after this many seconds
             t = time.monotonic()
-            now = lambda: time.monotonic()
-            while now() - t > timeout:
+            while time.monotonic() - t < timeout:
                 # we don't want to wait until the end of time
                 try:
-                    if self.user_multi_procs:
-                        break
-                    os.unlink(self.executable_path)
-                    logger.debug("successfully unlinked %s" % self.executable_path)
+                    os.unlink(exe_path)
+                    logger.debug("successfully unlinked %s" % exe_path)
                     break
                 except (OSError, RuntimeError, PermissionError):
                     time.sleep(0.01)
                     continue
                 except FileNotFoundError:
                     break
+        except Exception:
+            # Ignore any exceptions during destruction
+            pass
