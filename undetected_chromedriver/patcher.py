@@ -2,6 +2,7 @@
 # this module is part of undetected_chromedriver
 
 from packaging.version import Version as LooseVersion
+import atexit
 import io
 import json
 import logging
@@ -11,6 +12,7 @@ import platform
 import random
 import re
 import shutil
+import signal
 import string
 import subprocess
 import sys
@@ -100,6 +102,42 @@ class Patcher(object):
 
         self.version_main = version_main
         self.version_full = None
+
+        # Register cleanup handlers
+        self._cleanup_registered = False
+        self._register_cleanup_handlers()
+
+    def _register_cleanup_handlers(self):
+        """Register atexit and signal handlers for cleanup"""
+        if self._cleanup_registered:
+            return
+        
+        atexit.register(self.cleanup)
+        
+        # Only register signal handlers on POSIX systems
+        # Windows does not support SIGTERM in the same way
+        if IS_POSIX:
+            signal.signal(signal.SIGTERM, self._signal_handler)
+            signal.signal(signal.SIGINT, self._signal_handler)
+        
+        self._cleanup_registered = True
+        logger.debug("cleanup handlers registered")
+
+    def _signal_handler(self, signum, frame):
+        """Handle termination signals"""
+        logger.info("Received signal %s, cleaning up...", signum)
+        self.cleanup()
+        sys.exit(0)
+
+    def cleanup(self):
+        """Clean up chromedriver processes and files"""
+        logger.debug("cleanup called")
+        try:
+            # Kill any running chromedriver instances
+            if hasattr(self, 'executable_path') and self.executable_path:
+                self.force_kill_instances(self.executable_path)
+        except Exception as e:
+            logger.debug("error during cleanup: %s", e)
 
     def _set_platform_name(self):
         """
@@ -342,8 +380,20 @@ class Patcher(object):
                 return False
         else:
             try:
+                # Windows: Hide console window
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                creationflags = subprocess.CREATE_NO_WINDOW
+                
                 # TASKKILL /F /IM chromedriver.exe
-                result = subprocess.run(["taskkill", "/f", "/im", exe_name], check=False, capture_output=True)
+                result = subprocess.run(
+                    ["taskkill", "/f", "/im", exe_name],
+                    check=False,
+                    capture_output=True,
+                    startupinfo=startupinfo,
+                    creationflags=creationflags
+                )
                 # taskkill returns 0 if process was killed, 128 if not found.
                 return result.returncode == 0
             except Exception as e:
@@ -404,20 +454,23 @@ class Patcher(object):
             # if the driver binary is specified by user
             # we assume it is important enough to not delete it
             return
-        else:
-            timeout = 3  # stop trying after this many seconds
-            t = time.monotonic()
-            now = lambda: time.monotonic()
-            while now() - t > timeout:
-                # we don't want to wait until the end of time
-                try:
-                    if self.user_multi_procs:
-                        break
-                    os.unlink(self.executable_path)
-                    logger.debug("successfully unlinked %s" % self.executable_path)
-                    break
-                except (OSError, RuntimeError, PermissionError):
-                    time.sleep(0.01)
-                    continue
-                except FileNotFoundError:
-                    break
+        
+        # Perform cleanup of any running chromedriver processes
+        self.cleanup()
+        
+        if self.user_multi_procs:
+            return
+        
+        timeout = 3  # stop trying after this many seconds
+        t = time.monotonic()
+        while time.monotonic() - t < timeout:
+            # we don't want to wait until the end of time
+            try:
+                os.unlink(self.executable_path)
+                logger.debug("successfully unlinked %s" % self.executable_path)
+                break
+            except (OSError, RuntimeError, PermissionError):
+                time.sleep(0.01)
+                continue
+            except FileNotFoundError:
+                break
